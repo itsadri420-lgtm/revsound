@@ -12,9 +12,12 @@ import android.content.pm.PackageManager;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
+import android.graphics.Path;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.media.AudioAttributes;
+import android.media.AudioFormat;
+import android.media.AudioTrack;
 import android.media.MediaPlayer;
 import android.media.PlaybackParams;
 import android.net.Uri;
@@ -23,8 +26,10 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
 import android.widget.Button;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.SeekBar;
@@ -36,6 +41,7 @@ import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Random;
 import java.util.Set;
 import java.util.UUID;
 
@@ -60,7 +66,19 @@ public class MainActivity extends Activity {
 
     TextView status, rpmText, soundName;
     Gauge gauge;
-    Button btConnect, btSound, btEngine;
+    Button btConnect, btSound, btEngine, tabObd, tabSim;
+    FrameLayout root;
+    ScrollView pageObd, pageSim;
+
+    // Simulation
+    float simRpm = 0, simTarget = 0;
+    boolean simPedal = false;
+    Handler simH = new Handler(Looper.getMainLooper());
+    Runnable simLoop;
+    CarView carView;
+    Gauge simGauge;
+    TextView simRpmText;
+    PopEngine pop;
 
     int d(int v) {
         return (int) (v * dp);
@@ -74,19 +92,81 @@ public class MainActivity extends Activity {
         bt = BluetoothAdapter.getDefaultAdapter();
         getWindow().setStatusBarColor(BG);
         getWindow().setNavigationBarColor(BG);
+        pop = new PopEngine();
 
         String savedUri = sp.getString("sound", null);
         if (savedUri != null) soundUri = Uri.parse(savedUri);
         baseRpm = sp.getInt("base", 900);
         maxRpm = sp.getInt("max", 7000);
 
+        root = new FrameLayout(this);
+        root.setBackgroundColor(BG);
+
+        LinearLayout tabs = new LinearLayout(this);
+        tabs.setOrientation(LinearLayout.HORIZONTAL);
+        tabs.setPadding(d(18), d(44), d(18), 0);
+        tabObd = tabBtn("OBD-Modus", true);
+        tabSim = tabBtn("Simulation", false);
+        addW(tabs, tabObd);
+        addW(tabs, tabSim);
+
+        pageObd = buildObdPage();
+        pageSim = buildSimPage();
+
+        FrameLayout content = new FrameLayout(this);
+        content.addView(pageObd);
+        content.addView(pageSim);
+        pageSim.setVisibility(View.GONE);
+
+        LinearLayout outer = new LinearLayout(this);
+        outer.setOrientation(LinearLayout.VERTICAL);
+        outer.addView(tabs, new LinearLayout.LayoutParams(-1, -2));
+        outer.addView(content, new LinearLayout.LayoutParams(-1, 0, 1f));
+        root.addView(outer, new FrameLayout.LayoutParams(-1, -1));
+        setContentView(root);
+
+        tabObd.setOnClickListener(v -> switchTab(true));
+        tabSim.setOnClickListener(v -> switchTab(false));
+    }
+
+    void switchTab(boolean obd) {
+        pageObd.setVisibility(obd ? View.VISIBLE : View.GONE);
+        pageSim.setVisibility(obd ? View.GONE : View.VISIBLE);
+        stylizeTab(tabObd, obd);
+        stylizeTab(tabSim, !obd);
+        if (!obd) startSimLoop();
+        else stopSimLoop();
+    }
+
+    Button tabBtn(String s, boolean on) {
+        Button b = new Button(this);
+        b.setText(s);
+        b.setAllCaps(false);
+        b.setTypeface(Typeface.DEFAULT_BOLD);
+        b.setStateListAnimator(null);
+        stylizeTab(b, on);
+        return b;
+    }
+
+    void stylizeTab(Button b, boolean on) {
+        if (on) {
+            b.setTextColor(0xFF07101F);
+            b.setBackground(boxBg(CYAN, 0, 12));
+        } else {
+            b.setTextColor(DIM);
+            b.setBackground(boxBg(0x22FFFFFF, 0x33555577, 12));
+        }
+    }
+
+    // ---------- OBD-Seite ----------
+    ScrollView buildObdPage() {
         ScrollView sv = new ScrollView(this);
         sv.setBackgroundColor(BG);
         LinearLayout col = new LinearLayout(this);
         col.setOrientation(LinearLayout.VERTICAL);
-        col.setPadding(d(18), d(44), d(18), d(28));
+        col.setPadding(d(18), d(14), d(18), d(28));
 
-        TextView title = text("RevSound", 28, CYAN, true);
+        TextView title = text("RevSound", 26, CYAN, true);
         title.setLetterSpacing(0.08f);
         col.addView(title);
         col.addView(text("OBD2-Drehzahl → Motorsound", 13, DIM, false), lp(4));
@@ -102,7 +182,7 @@ public class MainActivity extends Activity {
 
         LinearLayout c2 = card();
         c2.addView(text("2. Sound", 15, TXT, true));
-        c2.addView(text("Eigene Aufnahme oder lizenzfreien Sound als Leerlauf-Loop wählen (mp3/wav).", 12, DIM, false), lp(6));
+        c2.addView(text("Eigene Aufnahme oder lizenzfreien Sound als Leerlauf-Loop wählen (mp3/wav). Gilt für OBD-Modus und Simulation.", 12, DIM, false), lp(6));
         btSound = btn("Sound wählen", false);
         c2.addView(btSound, lp(10));
         soundName = text(soundUri != null ? "Gewählt: " + nameOf(soundUri) : "Kein Sound gewählt", 12, GREEN, false);
@@ -172,11 +252,124 @@ public class MainActivity extends Activity {
         col.addView(c4, lp(16));
 
         sv.addView(col);
-        setContentView(sv);
 
         btConnect.setOnClickListener(v -> pickDevice());
         btSound.setOnClickListener(v -> pickSound());
         btEngine.setOnClickListener(v -> toggleEngine());
+        return sv;
+    }
+
+    // ---------- Simulations-Seite ----------
+    ScrollView buildSimPage() {
+        ScrollView sv = new ScrollView(this);
+        sv.setBackgroundColor(BG);
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.setPadding(d(18), d(14), d(18), d(28));
+
+        col.addView(text("Simulation", 24, CYAN, true));
+        col.addView(text("Teste den Sound ohne Auto – mit virtuellem Gaspedal", 13, DIM, false), lp(4));
+
+        LinearLayout cc = card();
+        carView = new CarView(this);
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(-1, d(140));
+        cc.addView(carView, clp);
+        col.addView(cc, lp(14));
+
+        LinearLayout gc = card();
+        gc.setGravity(Gravity.CENTER);
+        simGauge = new Gauge(this);
+        LinearLayout.LayoutParams gglp = new LinearLayout.LayoutParams(-1, d(150));
+        gc.addView(simGauge, gglp);
+        simRpmText = text("0 U/min", 24, CYAN, true);
+        simRpmText.setGravity(Gravity.CENTER);
+        gc.addView(simRpmText, lp(4));
+        col.addView(gc, lp(14));
+
+        LinearLayout pc = card();
+        pc.addView(text("Gaspedal (gedrückt halten)", 13, DIM, false));
+        PedalView pedal = new PedalView(this);
+        LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(-1, d(110));
+        plp.topMargin = d(8);
+        pc.addView(pedal, plp);
+        col.addView(pc, lp(14));
+
+        Button popBtn = btn("💥 Pop-Sound jetzt auslösen", false);
+        col.addView(popBtn, lp(10));
+        popBtn.setOnClickListener(v -> pop.playPop(curSimSpeed()));
+
+        col.addView(text("Tipp: Lass das Gaspedal bei hoher Drehzahl schlagartig los, dann kommen automatisch Pop-Sounds.", 12, DIM, false), lp(10));
+
+        sv.addView(col);
+        return sv;
+    }
+
+    float curSimSpeed() {
+        return Math.max(0.3f, Math.min(2f, simRpm / Math.max(1, baseRpm)));
+    }
+
+    // ---------- Simulations-Logik ----------
+    void startSimLoop() {
+        if (soundUri != null && mp == null) startEngineSoundOnly();
+        if (simLoop != null) return;
+        simLoop = new Runnable() {
+            @Override
+            public void run() {
+                float dt = 0.05f;
+                if (simPedal) {
+                    simTarget = Math.min(maxRpm, simTarget + (maxRpm - baseRpm) * dt * 1.8f);
+                } else {
+                    simTarget = Math.max(baseRpm, simTarget - (maxRpm - baseRpm) * dt * 2.6f);
+                }
+                float prev = simRpm;
+                simRpm += (simTarget - simRpm) * 0.25f;
+                if (prev - simRpm > (maxRpm - baseRpm) * 0.12f && prev > baseRpm + (maxRpm - baseRpm) * 0.35f) {
+                    pop.playPop(curSimSpeed());
+                }
+                simRpmText.setText((int) simRpm + " U/min");
+                simGauge.setRpm((int) simRpm, maxRpm);
+                simGauge.invalidate();
+                carView.setIntensity((simRpm - baseRpm) / Math.max(1, maxRpm - baseRpm));
+                carView.invalidate();
+                if (mp != null) {
+                    float ratio = baseRpm > 0 ? simRpm / baseRpm : 1f;
+                    ratio = Math.max(0.4f, Math.min(3.0f, ratio));
+                    try {
+                        mp.setPlaybackParams(new PlaybackParams().setSpeed(ratio).setPitch(ratio));
+                    } catch (Exception ignored) {
+                    }
+                }
+                simH.postDelayed(this, 50);
+            }
+        };
+        simRpm = baseRpm;
+        simTarget = baseRpm;
+        simH.post(simLoop);
+    }
+
+    void stopSimLoop() {
+        if (simLoop != null) {
+            simH.removeCallbacks(simLoop);
+            simLoop = null;
+        }
+    }
+
+    void startEngineSoundOnly() {
+        if (soundUri == null) return;
+        try {
+            mp = new MediaPlayer();
+            mp.setAudioAttributes(new AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .build());
+            mp.setDataSource(this, soundUri);
+            mp.setLooping(true);
+            mp.setVolume(volume, volume);
+            mp.prepare();
+            mp.start();
+            running = true;
+        } catch (Exception ignored) {
+        }
     }
 
     SeekBar.OnSeekBarChangeListener seek(java.util.function.IntConsumer f) {
@@ -227,6 +420,12 @@ public class MainActivity extends Activity {
             b.setBackground(boxBg(0x2200E5FF, CYAN, 12));
         }
         return b;
+    }
+
+    void addW(LinearLayout r, View b) {
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0, -2, 1f);
+        p.setMargins(d(3), 0, d(3), 0);
+        r.addView(b, p);
     }
 
     LinearLayout.LayoutParams lp(int top) {
@@ -442,6 +641,7 @@ public class MainActivity extends Activity {
             mp.stop();
             mp.release();
             mp = null;
+            running = false;
             btEngine.setText("▶ Sound starten");
             return;
         }
@@ -472,6 +672,7 @@ public class MainActivity extends Activity {
         super.onDestroy();
         running = false;
         connected = false;
+        stopSimLoop();
         try {
             if (sock != null) sock.close();
         } catch (Exception ignored) {
@@ -482,6 +683,7 @@ public class MainActivity extends Activity {
         }
     }
 
+    // ---------- Drehzahlmesser ----------
     static class Gauge extends View {
         int rpm = 0, max = 7000;
         Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -507,6 +709,138 @@ public class MainActivity extends Activity {
             float frac = Math.max(0f, Math.min(1f, (float) rpm / max));
             p.setColor(frac > 0.85f ? Color.RED : Color.rgb(0, 229, 255));
             c.drawArc(cx - r, cy - r, cx + r, cy + r, 180, 180 * frac, false, p);
+        }
+    }
+
+    // ---------- Gaspedal ----------
+    class PedalView extends View {
+        Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        boolean pressed = false;
+
+        PedalView(Context c) {
+            super(c);
+        }
+
+        @Override
+        public boolean onTouchEvent(MotionEvent e) {
+            int a = e.getActionMasked();
+            if (a == MotionEvent.ACTION_DOWN) {
+                pressed = true;
+                simPedal = true;
+            } else if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) {
+                pressed = false;
+                simPedal = false;
+            }
+            invalidate();
+            return true;
+        }
+
+        @Override
+        protected void onDraw(Canvas c) {
+            float w = getWidth(), h = getHeight();
+            p.setStyle(Paint.Style.FILL);
+            p.setColor(pressed ? 0xFF1E6B3A : 0xFF1A2440);
+            c.drawRoundRect(0, 0, w, h, d(16), d(16), p);
+            p.setStyle(Paint.Style.STROKE);
+            p.setStrokeWidth(3);
+            p.setColor(pressed ? GREEN : 0x5500E5FF);
+            c.drawRoundRect(2, 2, w - 2, h - 2, d(16), d(16), p);
+            p.setStyle(Paint.Style.FILL);
+            p.setColor(TXT);
+            p.setTextAlign(Paint.Align.CENTER);
+            p.setTextSize(18 * dp);
+            c.drawText(pressed ? "GAS!" : "Gaspedal", w / 2, h / 2 + 6 * dp, p);
+        }
+    }
+
+    // ---------- Auto-Silhouette ----------
+    static class CarView extends View {
+        Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        float intensity = 0;
+        Random r = new Random();
+        float shake = 0;
+
+        CarView(Context c) {
+            super(c);
+        }
+
+        void setIntensity(float i) {
+            intensity = Math.max(0f, Math.min(1f, i));
+            shake = (r.nextFloat() - 0.5f) * intensity * 4f;
+        }
+
+        @Override
+        protected void onDraw(Canvas c) {
+            float w = getWidth(), h = getHeight();
+            float cy = h * 0.72f + shake;
+            p.setStyle(Paint.Style.FILL);
+            p.setColor(0xFF070A14);
+            c.drawRect(0, 0, w, h, p);
+            Path body = new Path();
+            float bx = w * 0.1f, bw = w * 0.8f, bh = h * 0.28f;
+            body.moveTo(bx, cy);
+            body.lineTo(bx + bw * 0.1f, cy - bh);
+            body.lineTo(bx + bw * 0.35f, cy - bh * 1.6f);
+            body.lineTo(bx + bw * 0.65f, cy - bh * 1.6f);
+            body.lineTo(bx + bw * 0.9f, cy - bh);
+            body.lineTo(bx + bw, cy);
+            body.close();
+            int glow = (int) (60 + intensity * 180);
+            p.setColor(Color.rgb(20, 40 + glow / 3, 60 + glow / 2));
+            c.drawPath(body, p);
+            p.setStyle(Paint.Style.STROKE);
+            p.setStrokeWidth(3);
+            p.setColor(Color.argb(255, 0, 180 + (int) (intensity * 75), 255));
+            c.drawPath(body, p);
+            p.setStyle(Paint.Style.FILL);
+            p.setColor(0xFF0A0E1A);
+            c.drawCircle(bx + bw * 0.22f, cy, bh * 0.45f, p);
+            c.drawCircle(bx + bw * 0.78f, cy, bh * 0.45f, p);
+            if (intensity > 0.05f) {
+                p.setColor(Color.argb((int) (150 * intensity), 255, 120, 0));
+                c.drawCircle(bx + bw + 6 * intensity * 10, cy - bh * 0.3f, 4 + intensity * 8, p);
+            }
+        }
+    }
+
+    // ---------- Pop-Sound (synthetisch) ----------
+    static class PopEngine {
+        void playPop(float pitch) {
+            new Thread(() -> {
+                try {
+                    int sr = 22050;
+                    int n = (int) (sr * 0.18f);
+                    short[] buf = new short[n];
+                    Random r = new Random();
+                    float decay = 7f;
+                    for (int i = 0; i < n; i++) {
+                        float t = i / (float) sr;
+                        float env = (float) Math.exp(-decay * t);
+                        float noise = (r.nextFloat() * 2 - 1);
+                        float tone = (float) Math.sin(2 * Math.PI * (90 * pitch) * t);
+                        float s = (noise * 0.6f + tone * 0.4f) * env;
+                        buf[i] = (short) Math.max(-32000, Math.min(32000, s * 28000));
+                    }
+                    AudioTrack at = new AudioTrack.Builder()
+                            .setAudioAttributes(new AudioAttributes.Builder()
+                                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                                    .build())
+                            .setAudioFormat(new AudioFormat.Builder()
+                                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                                    .setSampleRate(sr)
+                                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                                    .build())
+                            .setBufferSizeInBytes(buf.length * 2)
+                            .setTransferMode(AudioTrack.MODE_STATIC)
+                            .build();
+                    at.write(buf, 0, buf.length);
+                    at.play();
+                    Thread.sleep(220);
+                    at.release();
+                } catch (Exception ignored) {
+                }
+            }).start();
         }
     }
 }

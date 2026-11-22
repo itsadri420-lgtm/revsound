@@ -71,8 +71,7 @@ public class MainActivity extends Activity {
     ScrollView pageObd, pageSim;
 
     // Simulation
-    float simRpm = 0, simTarget = 0;
-    boolean simPedal = false;
+    float simRpm = 0, pedalFrac = 0;
     Handler simH = new Handler(Looper.getMainLooper());
     Runnable simLoop;
     CarView carView;
@@ -182,7 +181,7 @@ public class MainActivity extends Activity {
 
         LinearLayout c2 = card();
         c2.addView(text("2. Sound", 15, TXT, true));
-        c2.addView(text("Eigene Aufnahme oder lizenzfreien Sound als Leerlauf-Loop wählen (mp3/wav). Gilt für OBD-Modus und Simulation.", 12, DIM, false), lp(6));
+        c2.addView(text("Eigene Aufnahme als Leerlauf-Loop wählen (mp3/wav). Gilt für OBD-Modus und Simulation.", 12, DIM, false), lp(6));
         btSound = btn("Sound wählen", false);
         c2.addView(btSound, lp(10));
         soundName = text(soundUri != null ? "Gewählt: " + nameOf(soundUri) : "Kein Sound gewählt", 12, GREEN, false);
@@ -268,11 +267,11 @@ public class MainActivity extends Activity {
         col.setPadding(d(18), d(14), d(18), d(28));
 
         col.addView(text("Simulation", 24, CYAN, true));
-        col.addView(text("Teste den Sound ohne Auto – mit virtuellem Gaspedal", 13, DIM, false), lp(4));
+        col.addView(text("Finger auf dem Pedal nach oben = Gas geben, loslassen = runterbremsen", 13, DIM, false), lp(4));
 
         LinearLayout cc = card();
         carView = new CarView(this);
-        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(-1, d(140));
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(-1, d(130));
         cc.addView(carView, clp);
         col.addView(cc, lp(14));
 
@@ -287,9 +286,9 @@ public class MainActivity extends Activity {
         col.addView(gc, lp(14));
 
         LinearLayout pc = card();
-        pc.addView(text("Gaspedal (gedrückt halten)", 13, DIM, false));
+        pc.addView(text("Gaspedal – Höhe = Drehzahl, halten möglich", 13, DIM, false));
         PedalView pedal = new PedalView(this);
-        LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(-1, d(110));
+        LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(-1, d(220));
         plp.topMargin = d(8);
         pc.addView(pedal, plp);
         col.addView(pc, lp(14));
@@ -297,8 +296,7 @@ public class MainActivity extends Activity {
         Button popBtn = btn("💥 Pop-Sound jetzt auslösen", false);
         col.addView(popBtn, lp(10));
         popBtn.setOnClickListener(v -> pop.playPop(curSimSpeed()));
-
-        col.addView(text("Tipp: Lass das Gaspedal bei hoher Drehzahl schlagartig los, dann kommen automatisch Pop-Sounds.", 12, DIM, false), lp(10));
+        col.addView(text("Der Pop-Button ist ein einfacher Test-Effekt und reagiert nicht automatisch auf die Drehzahl. Für einen echten, zur Drehzahl passenden Pop-Sound bräuchte es eine eigene Pop-Aufnahme, sag Bescheid, wenn du eine hast.", 11, DIM, false), lp(8));
 
         sv.addView(col);
         return sv;
@@ -315,17 +313,10 @@ public class MainActivity extends Activity {
         simLoop = new Runnable() {
             @Override
             public void run() {
-                float dt = 0.05f;
-                if (simPedal) {
-                    simTarget = Math.min(maxRpm, simTarget + (maxRpm - baseRpm) * dt * 1.8f);
-                } else {
-                    simTarget = Math.max(baseRpm, simTarget - (maxRpm - baseRpm) * dt * 2.6f);
-                }
-                float prev = simRpm;
-                simRpm += (simTarget - simRpm) * 0.25f;
-                if (prev - simRpm > (maxRpm - baseRpm) * 0.12f && prev > baseRpm + (maxRpm - baseRpm) * 0.35f) {
-                    pop.playPop(curSimSpeed());
-                }
+                float targetRpm = baseRpm + pedalFrac * (maxRpm - baseRpm);
+                float attack = 0.45f, release = 0.30f;
+                float rate = targetRpm > simRpm ? attack : release;
+                simRpm += (targetRpm - simRpm) * rate;
                 simRpmText.setText((int) simRpm + " U/min");
                 simGauge.setRpm((int) simRpm, maxRpm);
                 simGauge.invalidate();
@@ -339,11 +330,11 @@ public class MainActivity extends Activity {
                     } catch (Exception ignored) {
                     }
                 }
-                simH.postDelayed(this, 50);
+                simH.postDelayed(this, 30);
             }
         };
         simRpm = baseRpm;
-        simTarget = baseRpm;
+        pedalFrac = 0;
         simH.post(simLoop);
     }
 
@@ -712,10 +703,11 @@ public class MainActivity extends Activity {
         }
     }
 
-    // ---------- Gaspedal ----------
+    // ---------- Gaspedal: vertikaler Schieberegler ----------
     class PedalView extends View {
         Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
         boolean pressed = false;
+        float lastFrac = 0;
 
         PedalView(Context c) {
             super(c);
@@ -724,12 +716,15 @@ public class MainActivity extends Activity {
         @Override
         public boolean onTouchEvent(MotionEvent e) {
             int a = e.getActionMasked();
-            if (a == MotionEvent.ACTION_DOWN) {
+            if (a == MotionEvent.ACTION_DOWN || a == MotionEvent.ACTION_MOVE) {
                 pressed = true;
-                simPedal = true;
+                float h = getHeight();
+                float frac = 1f - (e.getY() / h);
+                pedalFrac = Math.max(0f, Math.min(1f, frac));
+                lastFrac = pedalFrac;
             } else if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) {
                 pressed = false;
-                simPedal = false;
+                pedalFrac = 0;
             }
             invalidate();
             return true;
@@ -739,8 +734,11 @@ public class MainActivity extends Activity {
         protected void onDraw(Canvas c) {
             float w = getWidth(), h = getHeight();
             p.setStyle(Paint.Style.FILL);
-            p.setColor(pressed ? 0xFF1E6B3A : 0xFF1A2440);
+            p.setColor(0xFF1A2440);
             c.drawRoundRect(0, 0, w, h, d(16), d(16), p);
+            float fillH = h * lastFrac;
+            p.setColor(pressed ? 0xFF1E6B3A : 0xFF162A20);
+            c.drawRoundRect(0, h - fillH, w, h, d(16), d(16), p);
             p.setStyle(Paint.Style.STROKE);
             p.setStrokeWidth(3);
             p.setColor(pressed ? GREEN : 0x5500E5FF);
@@ -748,8 +746,8 @@ public class MainActivity extends Activity {
             p.setStyle(Paint.Style.FILL);
             p.setColor(TXT);
             p.setTextAlign(Paint.Align.CENTER);
-            p.setTextSize(18 * dp);
-            c.drawText(pressed ? "GAS!" : "Gaspedal", w / 2, h / 2 + 6 * dp, p);
+            p.setTextSize(16 * dp);
+            c.drawText(pressed ? (int) (lastFrac * 100) + " %" : "Gaspedal", w / 2, h / 2 + 6 * dp, p);
         }
     }
 
@@ -803,7 +801,7 @@ public class MainActivity extends Activity {
         }
     }
 
-    // ---------- Pop-Sound (synthetisch) ----------
+    // ---------- Pop-Sound (nur manuell, synthetisch, rein als Testknopf) ----------
     static class PopEngine {
         void playPop(float pitch) {
             new Thread(() -> {
